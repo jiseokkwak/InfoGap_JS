@@ -14,6 +14,7 @@ CLIP_benchmark/
 CLIP_eval/
 */__pycache__/
 llava/
+LISCENCE
 open_flamingo/
 pope_eval/
 scienceqa_eval/
@@ -22,5 +23,9 @@ venv38/
 vlm_eval/
 wandb/
 *.sh
-
+*.png
+*.jpg
+*.jpeg
 */*.pyc
+train/adversarial_training_clip_cossim_KLadded_noabs_logcorrected_forlogging_0104.py
+train/adversarial_training_clip_cossim_KLadded_noabs_logcorrected_forlogging_1224.py
