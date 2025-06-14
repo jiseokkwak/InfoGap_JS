@@ -22,4 +22,5 @@ venv38/
 vlm_eval/
 wandb/
 *.sh
-LICENSE
+
+*/*.pyc
