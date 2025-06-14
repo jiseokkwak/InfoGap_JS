@@ -1,4 +1,12 @@
 assets/
+analysis_plots/
+val/
+.vscode/
+cifar10_data/
+fgvc_data/
+output/
+pets/
+results_all/
 autoattack/
 bash/
 checkpoint/
