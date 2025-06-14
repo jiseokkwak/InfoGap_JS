@@ -12,6 +12,7 @@ bash/
 checkpoint/
 CLIP_benchmark/
 CLIP_eval/
+*/__pycache__/
 llava/
 open_flamingo/
 pope_eval/
