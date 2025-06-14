@@ -1,0 +1,16 @@
+assets/
+autoattack/
+bash/
+checkpoint/
+CLIP_benchmark/
+CLIP_eval/
+llava/
+open_flamingo/
+pope_eval/
+scienceqa_eval/
+venv/
+venv38/
+vlm_eval/
+wandb/
+*.sh
+LICENSE
