@@ -81,7 +81,7 @@ parser.add_argument('--leaky_relu', type=float, default=0.2, help='Leaky ReLU ne
 parser.add_argument('--disc_wu_coeff', type=float ,default=1, help='Warmup coefficient for discriminator')
 parser.add_argument('--temperature', type=float, default=1, help='Temperature for cosine similarity')
 parser.add_argument('--use_gp', type=str2bool, default=False, help='Whether to use gradient penalty on discriminator')
-parser.add_argument('--lambda_gp', type=float, default=3.0, help='Weight for gradient penalty term')
+parser.add_argument('--lambda_gp', type=float, default=10.0, help='Weight for gradient penalty term') # Changed default from 3.0 to 10.0 to match CA file
 # mutual-information estimator type
 parser.add_argument('--mi_est_type', type=str, default='DV',
                     choices=['DV', 'NCE'],
@@ -93,9 +93,14 @@ parser.add_argument('--regul', type = str, default='rkl', choices = ['rkl', 'log
 parser.add_argument('--lambda_type', type=str, default='normal', choices=['normal', 'annealing', 'grad_aware'],
                     help='Type of lambda adjustment: normal, annealing, grad_aware')
 parser.add_argument('--l2_reg_coeff', type=float, default=0.0, help='Coefficient for L2 regularization between adv and orig embeddings in outer loss')
-parser.add_argument('--shell_script_path', type=str, default="/home/aailab/kwakjs/InfoGap/RobustVLM/train/run_infogap.sh", help='Path to the executed shell script to save.') # 새 인자 추가
-parser.add_argument('--disc_arch', type=str, default='mlp', choices=['mlp', 'bilinear'], help='Discriminator architecture: mlp or bilinear')
+parser.add_argument('--shell_script_path', type=str, default="/home/aailab/kwakjs/InfoGap/RobustVLM/train/run_infogap.sh", help='Path to the executed shell script to save.')
+parser.add_argument('--disc_arch', type=str, default='mlp', choices=['mlp', 'bilinear', 'CA'], help='Discriminator architecture: mlp, bilinear, or CA (Cross-Attention)')
 parser.add_argument('--disc_low_rank', type=int, default=None, help='Low rank r for bilinear discriminator (if used). Default is full rank.')
+# Add new arguments for CrossAttnDiscriminator
+parser.add_argument('--disc_num_heads', type=int, default=4, help='Number of heads for CrossAttnDiscriminator')
+parser.add_argument('--disc_mlp_dim', type=int, default=512, help='MLP dimension for CrossAttnDiscriminator')
+parser.add_argument('--disc_use_spectral_norm', type=str2bool, default=False, help='Whether to use spectral norm in CrossAttnDiscriminator')
+parser.add_argument('--t_network_type', type=str, default='cossim', choices=['cossim', 'l2norm'], help='Type of T network for MI estimation: cossim or l2norm')
 args = parser.parse_args()
 
 if args.devices != '':
@@ -170,6 +175,8 @@ class ComputeInfoGapLossWrapper:
         elif self.args.disc_arch == 'bilinear':
             # For BilinearDisc, use all parameters for gradient norm calculation
             last_layer_params = list(self.discriminator.parameters())
+        elif self.args.disc_arch == 'CA': # Added case for Cross-Attention
+            last_layer_params = list(self.discriminator.classifier.parameters())
         else:
             raise ValueError(f"Unknown disc_arch for gradient norm: {self.args.disc_arch}")
             
@@ -202,12 +209,100 @@ class ComputeInfoGapLossWrapper:
 
         return loss
 
-class T(nn.Module):
-    def __init__(self, x_dim, y_dim):
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+def compute_gradient_penalty(discriminator, real_samples, fake_samples, text_embedding):
+    """
+    Discriminator에 대한 Gradient Penalty 계산
+    Args:
+        discriminator: 판별자 모델
+        real_samples: 실제 임베딩 (embedding_orig)
+        fake_samples: 적대적 임베딩 (embedding_adv)
+        text_embedding: 텍스트 임베딩 (y)
+    """
+    # 실제와 가짜 샘플 사이 랜덤 보간 가중치
+    batch_size = real_samples.size(0)
+    alpha = torch.rand(batch_size, 1, device=real_samples.device)
+    
+    # 실제와 가짜 샘플 간 보간점 계산
+    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
+    
+    # 보간된 샘플에 대한 판별자 출력
+    d_interpolates = discriminator(interpolates, text_embedding).squeeze()
+    
+    # 그래디언트 계산을 위한 가짜 레이블
+    fake = torch.ones(batch_size, device=real_samples.device, requires_grad=False)
+    
+    # 보간점에서 그래디언트 계산
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    
+    # Gradient Penalty: ||∇D(x)||_2 - 1)^2
+    gradients = gradients.view(batch_size, -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    
+    return gradient_penalty
+
+def compute_w(x, y, discriminator):
+    discriminator.eval()
+    for param in discriminator.parameters():
+        param.requires_grad = False
+
+    logits = discriminator(x, y).squeeze()
+    D_psi = torch.sigmoid(logits)
+    w = D_psi / (1.0 - D_psi + EPS)
+
+    discriminator.train()
+    for param in discriminator.parameters():
+        param.requires_grad = True
+
+    return w
+class ClipVisionModel(nn.Module):
+    def __init__(self, model, args, normalize):
         super().__init__()
+        self.model = model
+        self.args = args
+        self.normalize = normalize
+
+    def forward(self, vision, output_normalize=False):
+        if self.normalize is not None:
+            vision = self.normalize(vision)
+        embedding = self.model(vision)
+        if output_normalize:
+            embedding = F.normalize(embedding, dim=-1)
+        return embedding
+class T(nn.Module):
+    def __init__(self, x_dim, y_dim, t_network_type='cossim', temperature=1.0): # Added t_network_type and temperature
+        super().__init__()
+        self.t_network_type = t_network_type
+        self.temperature = temperature
+        # x_dim, y_dim are kept for API consistency if a learnable T network is used later
+
     def forward(self, x, y):
-        cos_sim = F.cosine_similarity(x, y, dim=1, eps=EPS)
-        return cos_sim/args.temperature
+        if self.t_network_type == 'cossim':
+            score = F.cosine_similarity(x, y, dim=1, eps=EPS)
+        elif self.t_network_type == 'l2norm':
+            # Negative L2 distance, so higher is "better" (more similar)
+            l2_dist = torch.norm(x - y, p=2, dim=1)
+            score = -l2_dist
+        else:
+            raise ValueError(f"Unknown t_network_type: {self.t_network_type}")
+        
+        if self.temperature == 0: # Avoid division by zero
+            return score
+        return score / self.temperature
 
 # MINE 수정: intermediate 반환
 class Mine(nn.Module):
@@ -361,6 +456,113 @@ class BilinearDisc(nn.Module):
         
         score = self.dropout_layer(score)
         return score.squeeze(-1) # Squeeze the last dimension, robust to (B) or (B,1) input to squeeze
+class MLPDiscriminator(nn.Module): # Renamed from Discriminator
+    def __init__(self, x_dim, y_dim):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(x_dim + y_dim, 512),
+            nn.Dropout(args.dropout),
+            nn.LeakyReLU(args.leaky_relu, inplace=True),
+            nn.Linear(512, 512),
+            nn.Dropout(args.dropout),
+            nn.LeakyReLU(args.leaky_relu, inplace=True),
+            nn.Linear(512, 1)
+        )
+
+    def forward(self, x, y):
+        xy = torch.cat([x, y], dim=1)
+        return self.layers(xy)
+# Add CrossAttnDiscriminator class definition
+class CrossAttnDiscriminator(nn.Module):
+    """
+    교차-어텐션 기반 텍스트-이미지 판별기
+    - 두 단계 잔차 + LayerNorm 구조 (Transformer 스타일)
+    - 스펙트럴 노름(option) 적용 가능
+    """
+    def __init__(
+        self,
+        dim: int, # x_dim will be passed here
+        y_dim: int, # y_dim, ensure it's same as dim for this architecture
+        # num_heads, mlp_dim, dropout, use_spectral_norm will be taken from args
+    ):
+        super().__init__()
+        if dim != y_dim:
+            # For this specific cross-attention model, it's often assumed x and y embeddings have the same dimension `dim`.
+            # If they are different, the design might need adjustment (e.g., projection layers).
+            # Here, we proceed using `dim` (from x_dim) as the primary internal dimension.
+            print(f"Warning: CrossAttnDiscriminator received x_dim={dim} and y_dim={y_dim}. Using x_dim ({dim}) for internal MultiheadAttention dimension. Ensure this is intended.")
+
+
+        num_heads = args.disc_num_heads # Accessing global args
+        mlp_dim = args.disc_mlp_dim     # Accessing global args
+        dropout_rate = args.dropout     # Accessing global args
+        use_spectral_norm = args.disc_use_spectral_norm # Accessing global args
+
+        # Ensure dim is divisible by num_heads for MultiheadAttention
+        # If x_dim and y_dim are different, and we use x_dim (dim) for MHA,
+        # y_dim might need projection if it's used as K,V and has a different dim than Q (from x_dim).
+        # However, the current MHA in PyTorch expects Q, K, V to have the same embed_dim if not specified otherwise.
+        # For simplicity, this implementation assumes Q, K, V will all be of dimension `dim`.
+        # If y_dim is different, it should be projected to `dim` before being passed to this discriminator,
+        # or this discriminator's design needs to handle differing Q and K/V dimensions.
+        # The current forward pass implies y is also expected to be of dimension `dim` after pre_ln.
+
+        if dim % num_heads != 0:
+            # Adjust num_heads to be a divisor of dim, or raise error
+            # For now, let's raise an error as this is a critical architectural constraint.
+            raise ValueError(f"embed_dim ({dim}) must be divisible by num_heads ({num_heads}) for CrossAttnDiscriminator.")
+
+
+        self.pre_ln = nn.LayerNorm(dim) # Single LayerNorm for dimension `dim`
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout_rate,
+            batch_first=True,
+        )
+
+        linear1 = nn.Linear(dim, mlp_dim)
+        linear2 = nn.Linear(mlp_dim, dim)
+        if use_spectral_norm:
+            linear1 = nn.utils.spectral_norm(linear1)
+            linear2 = nn.utils.spectral_norm(linear2)
+
+        self.ffn = nn.Sequential(
+            linear1,
+            nn.LeakyReLU(args.leaky_relu if hasattr(args, 'leaky_relu') else 0.1, inplace=True),
+            nn.Dropout(dropout_rate),
+            linear2,
+            nn.Dropout(dropout_rate),
+        )
+        self.post_attn_ln = nn.LayerNorm(dim)
+        self.classifier = nn.Linear(dim, 1)
+        if use_spectral_norm:
+            self.classifier = nn.utils.spectral_norm(self.classifier)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # x and y are expected to be compatible with `dim` for self.pre_ln
+        # If y's original dimension (y_dim) was different, it should be projected to `dim` before this call.
+        if x.shape[-1] != self.pre_ln.normalized_shape[0] or y.shape[-1] != self.pre_ln.normalized_shape[0]:
+            raise ValueError(f"Input x ({x.shape[-1]}) and y ({y.shape[-1]}) last dimension must match "
+                             f"discriminator's internal dimension ({self.pre_ln.normalized_shape[0]}) for pre_ln.")
+
+        if x.dim() == 2: x = x.unsqueeze(1)
+        if y.dim() == 2: y = y.unsqueeze(1)
+
+        q_in = self.pre_ln(x)
+        kv_in = self.pre_ln(y) # Both x and y go through the same pre_ln with `dim`
+
+        attn_out, _ = self.cross_attn(q_in, kv_in, kv_in)
+        x_res = x + attn_out
+
+        z_in = self.post_attn_ln(x_res)
+        z_out = self.ffn(z_in)
+        x_res = x_res + z_out
+
+        logits = self.classifier(x_res.mean(dim=1))
+        if logits.dim() > 1 and logits.size(1) == 1:
+            logits = logits.squeeze(1)
+        return logits
 
 class WeightedMine(nn.Module):
     """
@@ -1272,40 +1474,40 @@ def main():
     # --- BilinearDisc low_rank 자동 조정 로직 시작 ---
     if args.disc_arch == 'bilinear' and args.disc_low_rank is None:
         # MLPDiscriminator 파라미터 수 계산
-        mlp_input_dim = x_dim + y_dim
-        mlp_hidden1_units = 512  # MLPDiscriminator 정의 기준
-        mlp_hidden2_units = 512  # MLPDiscriminator 정의 기준
-        
-        params_mlp_layer1 = (mlp_input_dim * mlp_hidden1_units) + mlp_hidden1_units
-        params_mlp_layer2 = (mlp_hidden1_units * mlp_hidden2_units) + mlp_hidden2_units
-        params_mlp_layer3 = (mlp_hidden2_units * 1) + 1
-        total_mlp_params = params_mlp_layer1 + params_mlp_layer2 + params_mlp_layer3
+        # Assuming MLPDiscriminator structure if it were defined:
+        # mlp_input_dim = x_dim + y_dim
+        # mlp_hidden1_units = 512
+        # mlp_hidden2_units = 512
+        # params_mlp_layer1 = (mlp_input_dim * mlp_hidden1_units) + mlp_hidden1_units
+        # params_mlp_layer2 = (mlp_hidden1_units * mlp_hidden2_units) + mlp_hidden2_units
+        # params_mlp_layer3 = (mlp_hidden2_units * 1) + 1
+        # total_mlp_params = params_mlp_layer1 + params_mlp_layer2 + params_mlp_layer3
+        # Since MLPDiscriminator is not defined in this file, this auto-adjustment might not be fully functional
+        # or needs a placeholder for total_mlp_params.
+        # For now, let's assume a default or skip if MLP params cannot be estimated.
+        print("Warning: MLPDiscriminator definition not found in this file. BilinearDisc low_rank auto-adjustment based on MLP params might not be accurate.")
+        total_mlp_params = (x_dim + y_dim) * 512 + 512 + 512 * 512 + 512 + 512 * 1 + 1 # Placeholder estimation
 
-        # BilinearDiscriminator의 'dim'은 x_dim (이미지 임베딩 차원)을 사용합니다.
-        # Low-rank BilinearDisc 파라미터 수: 2 * dim_bilinear * r + 1 (bias=True 기본값)
         dim_bilinear = x_dim 
         
         if (2 * dim_bilinear) == 0:
-            calculated_r = None # x_dim이 0이면 계산 불가
-            print("Warning: BilinearDiscriminator의 dim (x_dim)이 0이므로, MLP 파라미터 수에 맞춘 low_rank r을 계산할 수 없습니다.")
+            calculated_r = None
+            print("Warning: BilinearDiscriminator's dim (x_dim) is 0. Cannot auto-calculate low_rank r.")
         else:
-            # 2 * dim_bilinear * r + 1 = total_mlp_params  => r = (total_mlp_params - 1) / (2 * dim_bilinear)
             calculated_r = (total_mlp_params - 1) / (2 * dim_bilinear)
             calculated_r = int(round(calculated_r))
 
         if calculated_r is not None and calculated_r > 0:
-            print(f"MLPDiscriminator의 예상 파라미터 수: {total_mlp_params}")
-            print(f"BilinearDiscriminator가 MLP와 유사한 파라미터 수를 갖도록 low_rank r을 {calculated_r}(으)로 자동 설정합니다.")
-            args.disc_low_rank = calculated_r # 계산된 r 값으로 args 업데이트
+            print(f"Estimated MLPDiscriminator params: {total_mlp_params}")
+            print(f"Auto-setting BilinearDiscriminator low_rank r to {calculated_r} for comparable params.")
+            args.disc_low_rank = calculated_r
             
             final_bilinear_params = 2 * dim_bilinear * calculated_r + 1
-            print(f"BilinearDiscriminator는 dim={dim_bilinear}, low_rank r={args.disc_low_rank}로 초기화되어 약 {final_bilinear_params}개의 파라미터를 가집니다.")
+            print(f"BilinearDiscriminator (dim={dim_bilinear}, r={args.disc_low_rank}) will have approx. {final_bilinear_params} params.")
         else:
-            print(f"MLP 파라미터 수에 맞는 유효한 low_rank r 값을 계산하지 못했습니다. "
-                  f"기존/기본 disc_low_rank 값({args.disc_low_rank})을 사용합니다.")
+            print(f"Could not calculate a valid low_rank r. Using provided/default disc_low_rank: {args.disc_low_rank}")
     # --- BilinearDisc low_rank 자동 조정 로직 끝 ---
 
-    # 판별자 인스턴스화 (이 부분은 기존 코드와 거의 동일, args.disc_low_rank가 위에서 변경될 수 있음)
     if args.disc_arch == 'mlp':
         if x_dim != model_orig.model.output_dim : 
              raise ValueError(f"x_dim {x_dim} for MLPDiscriminator should match model output_dim {model_orig.model.output_dim}")
@@ -1315,15 +1517,25 @@ def main():
         discriminator.apply(weights_init)
     elif args.disc_arch == 'bilinear':
         if x_dim != y_dim:
-            print(f"Warning: BilinearDiscriminator의 경우 이미지 임베딩 차원({x_dim})과 텍스트 임베딩 차원({y_dim})이 동일해야 이상적입니다. x_dim={x_dim}을 주요 차원으로 사용합니다.")
-        
-        # args.disc_low_rank는 위에서 자동 조정되었거나 사용자가 명시적으로 설정한 값일 수 있습니다.
+            print(f"Warning: BilinearDiscriminator: image embedding dim ({x_dim}) and text embedding dim ({y_dim}) differ. Using x_dim={x_dim} as the primary dimension.")
         discriminator = BilinearDisc(dim=x_dim, low_rank=args.disc_low_rank, dropout=args.dropout).to(device)
-        # BilinearDisc는 자체 init_weights를 호출하므로, discriminator.apply(weights_init)는 필요하지 않을 수 있습니다.
+        # BilinearDisc has its own init_weights
+    elif args.disc_arch == 'CA': # New branch for Cross-Attention
+        # For CrossAttnDiscriminator, if x_dim and y_dim are different,
+        # the current implementation of CrossAttnDiscriminator assumes y will be projected to x_dim,
+        # or that x_dim is used as the main dimension.
+        # The MHA expects Q, K, V to have the same dimension unless kdim/vdim are specified.
+        # The CrossAttnDiscriminator uses args for num_heads, mlp_dim, dropout, spectral_norm.
+        # The `dim` argument to CrossAttnDiscriminator should be the primary embedding dimension (e.g., x_dim).
+        # The `y_dim` argument is also passed for clarity or future use if y needs projection.
+        discriminator = CrossAttnDiscriminator(dim=x_dim, y_dim=y_dim).to(device)
+        # CrossAttnDiscriminator does not have a specific weights_init applied in the CA script.
+        # Consider if weights_init should be applied:
+        # discriminator.apply(weights_init)
     else:
         raise ValueError(f"알 수 없는 판별자 아키텍처: {args.disc_arch}")
     
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=args.disc_lr_coeff * args.lr, betas=(0.5, 0.999), weight_decay=args.disc_wd_coeff*args.wd)
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=args.disc_lr_coeff * args.lr, betas=(args.beta1 if hasattr(args, 'beta1') else 0.5, 0.999), weight_decay=args.disc_wd_coeff*args.wd) # Use args.beta1
     total_discriminator_steps = args.discriminator_pretrain_steps + args.steps
     scheduler_d = cosine_lr(optimizer_d, args.lr, args.warmup * args.disc_wu_coeff, total_discriminator_steps)
 
@@ -1428,11 +1640,12 @@ def main():
         for param in model.parameters():
             param.requires_grad = True
 
-    T_network = T(x_dim, y_dim).to(device)
-    mi_estimator_weighted = WeightedMine(T_network, discriminator,
+    T_network = T(x_dim, y_dim, t_network_type=args.t_network_type, temperature=args.temperature).to(device) # Updated instantiation
+
+    mi_estimator_weighted = WeightedMine(T_network, discriminator, # Pass discriminator to WeightedMine
                                          alpha=args.alpha,
                                          est_type=args.mi_est_type).to(device)
-    mi_estimator_standard = Mine(T_network,
+    mi_estimator_standard = Mine(T_network, # T_network already has temperature
                                  alpha=args.alpha,
                                  est_type=args.mi_est_type).to(device)
 
