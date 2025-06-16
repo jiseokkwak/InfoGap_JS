@@ -124,7 +124,7 @@ class ComputeInfoGapLossWrapper:
         # Temporarily enable gradients for the requested parameters
         orig_flags = [p.requires_grad for p in target_layer]
         for p in target_layer:
-            p.requires_grad_(True)
+            p.requires_grad_(True) # 일시적으로 True로 설정
 
         # Compute gradients w.r.t. target_layer
         grads = torch.autograd.grad(
@@ -140,7 +140,7 @@ class ComputeInfoGapLossWrapper:
 
         # Restore original requires_grad flags and clear any accumulated grads
         for p, flag in zip(target_layer, orig_flags):
-            p.requires_grad_(flag)
+            p.requires_grad_(flag) # 원래 상태로 복원
             p.grad = None
 
         return grad_norm
@@ -152,14 +152,14 @@ class ComputeInfoGapLossWrapper:
         
 
         if self.args.regul == 'rkl':
-            E_q_wlog_w = (w_q * torch.log(w_q + 1e-8)).mean()
+            Div_as_regul = (w_q * torch.log(w_q + 1e-8)).mean()
         elif self.args.regul == 'logchi':
             chi_squared = ((w_q - 1)**2).mean()
-            E_q_wlog_w = torch.log(1 + chi_squared + 1e-8) # Add epsilon for stability if chi_squared can be 0
+            Div_as_regul = torch.log(1 + chi_squared + 1e-8) # Add epsilon for stability if chi_squared can be 0
         elif self.args.regul == 'chi':
-            E_q_wlog_w = ((w_q - 1)**2).mean()
+            Div_as_regul = ((w_q - 1)**2).mean()
         elif self.args.regul == 'neymanchi':
-            E_q_wlog_w = (((w_q - 1)**2)/w_q).mean()
+            Div_as_regul = (((w_q - 1)**2)/w_q).mean()
         else:
             raise ValueError(f"Unknown regul type: {self.args.regul}")
 
@@ -167,7 +167,7 @@ class ComputeInfoGapLossWrapper:
         weighted_mi, _, _, _, _, _, _, _ = self.mi_estimator_weighted(embedding_adv, self.y, w_q)
         standard_mi, _, _, _, _ = self.mi_estimator_standard(embedding_adv, self.y)
         loss_info_term = weighted_mi - standard_mi
-        loss_kld_term = E_q_wlog_w
+        loss_kld_term = Div_as_regul
 
         # Gradient Norm 계산
         if self.args.disc_arch == 'mlp':
@@ -254,6 +254,20 @@ def compute_gradient_penalty(discriminator, real_samples, fake_samples, text_emb
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
     
     return gradient_penalty
+
+def calc_regul_term(w_q, regul):
+    if regul == 'rkl':
+        return (w_q * torch.log(w_q + 1e-8)).mean()
+    elif regul == 'logchi':
+        chi2 = ((w_q - 1) ** 2).mean()
+        return torch.log(1 + chi2 + 1e-8)
+    elif regul == 'chi':
+        return ((w_q - 1) ** 2).mean()
+    elif regul == 'neymanchi':
+        return (((w_q - 1) ** 2) / (w_q + 1e-8)).mean()
+    else:
+        raise ValueError(f"Unknown regul: {regul}")
+
 
 def compute_w(x, y, discriminator):
     discriminator.eval()
@@ -900,7 +914,7 @@ def train_one_epoch(
             embedding_text_labels_norm=embedding_text_labels_norm, # All class text embeddings
             reduction='mean',
             loss='ce',
-            logit_scale=1.0 / args.temperature # Corresponds to 1/tau in the user's formula
+            logit_scale=100.0 / args.temperature # Corresponds to 1/tau in the user's formula
         )
 
         # 4) Inner Maximization (Adversarial Attack)
@@ -963,10 +977,10 @@ def train_one_epoch(
         # Grads for discriminator and MI estimators are enabled here for the outer minimization
         for param in discriminator.parameters():
             param.requires_grad = True
-        for param in mi_estimator_weighted.parameters():
-            param.requires_grad = True
-        for param in mi_estimator_standard.parameters():
-            param.requires_grad = True
+        #for param in mi_estimator_weighted.parameters():
+        #    param.requires_grad = True
+        #for param in mi_estimator_standard.parameters():
+        #    param.requires_grad = True
 
         embedding_clean = model(data, output_normalize=args.output_normalize)
         embedding_adv = model(data_adv, output_normalize=args.output_normalize)
@@ -985,8 +999,11 @@ def train_one_epoch(
         D_psi_q = torch.sigmoid(logits_q)
         w_p = D_psi_p / (1.0 - D_psi_p + EPS)
         w_q = D_psi_q / (1.0 - D_psi_q + EPS)
-        E_q_wlog_w = (w_q * torch.log(w_q + 1e-8)).mean()
-        metrics['E_q_wlog_w'].append(E_q_wlog_w.item())
+        #Div_as_regul = (w_q * torch.log(w_q + 1e-8)).mean()
+        
+        Div_as_regul = calc_regul_term(w_q, args.regul)
+
+        metrics['Div_as_regul'].append(Div_as_regul.item())
         # 6.2 Mutual Information estimates (Weighted & Standard)
         weighted_mi, t_adv_w, w_value_w, t_shuffled_w, wt_value, wt_shuffled_value, first_term_weighted, second_term_weighted = \
             mi_estimator_weighted(embedding_adv, y, w_q)
@@ -997,9 +1014,9 @@ def train_one_epoch(
         # loss_phi_abs의 디폴트값은 false임 --> loss_phi_abs가 True일 경우, loss_phi에 절대값을 취함
         # parsing 잘 되어있는지 확인해야 함
         if not args.loss_phi_abs:
-            loss_phi_infogap = weighted_mi - standard_mi + args.lambda_val * E_q_wlog_w
+            loss_phi_infogap = weighted_mi - standard_mi + args.lambda_val * Div_as_regul
         else:
-            loss_phi_infogap = (weighted_mi - standard_mi + args.lambda_val * E_q_wlog_w)**2
+            loss_phi_infogap = (weighted_mi - standard_mi + args.lambda_val * Div_as_regul)**2
         
         # L2 regularization term 추가
         l2_reg_loss = 0.0
@@ -1011,14 +1028,23 @@ def train_one_epoch(
 
         loss_phi = loss_phi_infogap + args.l2_reg_coeff * l2_reg_loss
 
+        # 6.3 loss_phi 계산 직전
+        # ────────────────────────────────────────────────
+        # 판별자 그래디언트 완전 비활성화
+        for p in discriminator.parameters():
+            p.requires_grad_(False)
+
         optimizer.zero_grad()
         loss_phi.backward()
-        if args.grad_clip == True:
+        if args.grad_clip:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
         optimizer.step()
         scheduler(step_total)
-        batch_size = args.batch_size
+
+        # 다시 판별자 활성화
+        for p in discriminator.parameters():
+            p.requires_grad_(True)
+        # ────────────────────────────────────────────────
         # 6.4 Discriminator update
         labels_real = torch.ones(n_samples, device=device)
         labels_fake = torch.zeros(n_samples, device=device)
@@ -1334,10 +1360,10 @@ def plot_metrics(metrics, checkpoint_dir, step):
     plt.title('L2 Distance (Adv vs. Clean)')
     plt.legend()
 
-    # 9) E_q_wlog_w (KLD Estimator term)
+    # 9) Div_as_regul (KLD Estimator term)
     plt.subplot(5, 2, 9)
-    if 'E_q_wlog_w' in metrics and metrics['E_q_wlog_w']:
-        plt.plot(metrics['E_q_wlog_w'], label=f"E_q[w log w] (Final: {metrics['E_q_wlog_w'][-1]:.4f})", color='indigo')
+    if 'Div_as_regul' in metrics and metrics['Div_as_regul']:
+        plt.plot(metrics['Div_as_regul'], label=f"E_q[w log w] (Final: {metrics['Div_as_regul'][-1]:.4f})", color='indigo')
     plt.xlabel('Steps')
     plt.ylabel('Value')
     plt.title('KLD Term Estimate (E_q[w log w])')
@@ -1664,7 +1690,7 @@ def main():
         'w_q': [],
         'D_p': [],       # clean에 대한 Discriminator sigmoid
         'D_q': [],       # adv에 대한 Discriminator sigmoid
-        'E_q_wlog_w': [],
+        'Div_as_regul': [],
         'grad_info_norm': [],       # Gradient norm for Info term (Discriminator last layer)
         'grad_kld_norm': [],        # Gradient norm for KLD term (Discriminator last layer)
         'gradient_penalty': []      # Gradient penalty for discriminator
