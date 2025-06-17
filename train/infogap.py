@@ -1262,7 +1262,7 @@ def train_one_epoch(
 
         print(f"[Step {step_total}] loss_phi: {loss_phi.item():.4f}, loss_d: {loss_d.item():.4f}")
         print(f"T(X,Y) mean (weighted): {t_adv_w.mean().item():.4f}, w(X,Y) mean: {w_value_w.mean().item():.4f}, T(X',Y) mean (weighted): {t_shuffled_w.mean().item():.4f}")
-        print(f"Weighted_MI: {weighted_mi.item():.4f}, Standard_MI: {standard_mi.item():.4f}, w_p_mean: {mean_w_p:.4f}")
+        print(f"Weighted_MI: {weighted_mi.item():.4f}, Standard_MI: {standard_mi.item():.4f}, mean_w_q: {mean_w_q:.4f}")
         print(f"Cos-Sim (adv vs orig): {cos_sim_meter.avg:.4f}, Cos-Sim (adv vs text): {cos_sim_image_text.item():.4f}, Acc: {acc_meter.avg:.2f}%, Robust Acc: {racc_meter.avg:.2f}%")
 
         # (Optional) UMAP visualization
