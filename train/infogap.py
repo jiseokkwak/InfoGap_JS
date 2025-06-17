@@ -192,10 +192,21 @@ class ComputeInfoGapLossWrapper:
         if self.args.lambda_type == 'normal':
             adaptive_lambda = self.lambda_val
         elif self.args.lambda_type == 'annealing':
-            if step is not None and total_steps is not None:
-                adaptive_lambda = self.lambda_val * (step / total_steps)
+            # current_lambda_val = args.lambda_val * (step_total / args.steps) if args.steps > 0 else args.lambda_val
+            # 코사인 어닐링을 사용한 완만한 증가:
+            min_lambda_ratio = 0.1 # 최소 람다 비율 (args.lambda_val의 10%)
+            max_lambda = args.lambda_val
+            min_lambda = args.lambda_val * min_lambda_ratio
+
+            if args.steps > 0 and step_total <= args.steps:
+                # 코사인 곡선은 일반적으로 감소하는 형태이므로, 증가하도록 변형
+                # 0에서 pi까지 코사인 값은 1에서 -1로 변함.
+                # (1 - cos(pi * progress)) / 2  는 0에서 1로 증가하는 곡선
+                progress = step_total / args.steps
+                cosine_progress = (1 - math.cos(math.pi * progress)) / 2
+                current_lambda_val = min_lambda + (max_lambda - min_lambda) * cosine_progress
             else:
-                adaptive_lambda = self.lambda_val
+                current_lambda_val = args.lambda_val
         elif self.args.lambda_type == 'grad_aware':
             adaptive_lambda = grad_info_norm / (grad_kld_norm + 1e-8)
         else:
@@ -602,8 +613,9 @@ class WeightedMine(nn.Module):
 
             perm = torch.randperm(B)
             y_shf = y[perm]
-            with torch.no_grad():
-                w_shf = compute_w(x, y_shf, self.discriminator).detach()
+            # with torch.no_grad():
+            #     w_shf = compute_w(x, y_shf, self.discriminator).detach()
+            w_shf = compute_w(x, y_shf, self.discriminator)  # w_shf is computed from the discriminator
             t_shf = self.T(x, y_shf)
 
             second_term = torch.log((w_shf * torch.exp(t_shf)).mean() + EPS)
@@ -617,14 +629,14 @@ class WeightedMine(nn.Module):
             x_rep = x.unsqueeze(1).expand(B, B, -1).reshape(B*B, -1)
             y_rep = y.unsqueeze(0).expand(B, B, -1).reshape(B*B, -1)
 
-            with torch.no_grad():
+            #with torch.no_grad():
                 # Ensure discriminator is in eval mode for w_mat computation if it has dropout/batchnorm
                 # However, compute_w already handles this, but if called directly, it's good practice.
                 # For NCE, w is not passed directly but computed internally or related to discriminator scores.
                 # The patch implies w_mat is derived from discriminator scores on all pairs.
-                logits_mat = self.discriminator(x_rep, y_rep).view(B,B)
-                w_mat = torch.sigmoid(logits_mat)
-                w_mat = w_mat / (1 - w_mat + EPS)          # importance weights
+            logits_mat = self.discriminator(x_rep, y_rep).view(B,B)
+            w_mat = torch.sigmoid(logits_mat)
+            w_mat = w_mat / (1 - w_mat + EPS)          # importance weights
 
             T_all = self.T(x_rep, y_rep).view(B, B)
 
@@ -875,6 +887,41 @@ def get_fixed_subset_indices(dataset, subset_size=100, seed=42):
     chosen_indices = all_indices[:subset_size]
     return chosen_indices
 
+def compute_gradient_norm_for_lambda(loss, target_parameters):
+    """Helper function to compute gradient norm for adaptive lambda."""
+    if not target_parameters: # Handle cases where target_parameters might be empty
+        return torch.tensor(0.0, device=loss.device)
+    
+    # Ensure requires_grad is True for target_parameters for this computation
+    original_requires_grad = [p.requires_grad for p in target_parameters]
+    for p in target_parameters:
+        p.requires_grad_(True)
+
+    grads = torch.autograd.grad(
+        loss,
+        target_parameters,
+        retain_graph=True, # Keep graph for subsequent backward passes if needed
+        create_graph=True, # Create graph for potential higher-order derivatives if lambda itself is learned
+        allow_unused=True, # Allow unused if some params in target_parameters are not part of the loss
+    )
+    
+    valid_grads = [g for g in grads if g is not None]
+    if not valid_grads:
+        grad_norm = torch.tensor(0.0, device=loss.device)
+    else:
+        grad_norm = torch.sqrt(
+            sum(torch.sum(g ** 2) for g in valid_grads)
+        )
+
+    # Restore original requires_grad flags
+    for p, req_grad in zip(target_parameters, original_requires_grad):
+        p.requires_grad_(req_grad)
+        # Do not zero out p.grad here as this function is called mid-computation
+        # and other backward passes might rely on accumulated gradients.
+        # The main optimizer.zero_grad() should handle clearing gradients before optimizer.step().
+
+    return grad_norm
+
 def train_one_epoch(
     step_total, model, model_orig, dataloader, optimizer, scheduler, normalize,
     embedding_text_labels_norm, args, epoch, discriminator, optimizer_d,
@@ -999,7 +1046,6 @@ def train_one_epoch(
         D_psi_q = torch.sigmoid(logits_q)
         w_p = D_psi_p / (1.0 - D_psi_p + EPS)
         w_q = D_psi_q / (1.0 - D_psi_q + EPS)
-        #Div_as_regul = (w_q * torch.log(w_q + 1e-8)).mean()
         
         Div_as_regul = calc_regul_term(w_q, args.regul)
 
@@ -1011,12 +1057,70 @@ def train_one_epoch(
             mi_estimator_standard(embedding_adv, y)
 
         # 6.3 Loss phi loss 계산
-        # loss_phi_abs의 디폴트값은 false임 --> loss_phi_abs가 True일 경우, loss_phi에 절대값을 취함
-        # parsing 잘 되어있는지 확인해야 함
+        loss_info_term_outer = weighted_mi - standard_mi
+        loss_kld_term_outer = Div_as_regul
+
+        # Adaptive lambda calculation (similar to ComputeInfoGapLossWrapper)
+        current_lambda_val = args.lambda_val # Default
+        if args.lambda_type != 'normal':
+            # Determine target parameters for gradient norm (discriminator's last layer)
+            if args.disc_arch == 'mlp':
+                disc_target_params = list(discriminator.layers[-1].parameters())
+            elif args.disc_arch == 'bilinear':
+                disc_target_params = list(discriminator.parameters())
+            elif args.disc_arch == 'CA':
+                disc_target_params = list(discriminator.classifier.parameters())
+            else:
+                # Fallback or raise error if architecture is unknown for grad norm
+                disc_target_params = [] # Or handle error appropriately
+                print(f"Warning: Unknown disc_arch '{args.disc_arch}' for adaptive lambda gradient norm. Using default lambda.")
+
+
+            if disc_target_params: # Proceed only if target params are identified
+                # Detach terms if they are already part of a graph that will be backwarded later for model update
+                # to avoid issues with graph retention.
+                # However, for grad_norm calculation, we need them to be part of the current graph.
+                # The compute_gradient_norm_for_lambda function handles retain_graph=True.
+                
+                # Ensure MI estimators and discriminator are in training mode for grad computation
+                # (though they should be already from earlier in the loop)
+                # mi_estimator_weighted.train() # If they have dropout/bn
+                # mi_estimator_standard.train()
+                # discriminator.train()
+
+                grad_info_norm_outer = compute_gradient_norm_for_lambda(loss_info_term_outer, disc_target_params)
+                grad_kld_norm_outer = compute_gradient_norm_for_lambda(loss_kld_term_outer, disc_target_params)
+
+                if metrics is not None: # Log these specific grad norms if desired
+                    metrics.setdefault('grad_info_norm_outer', []).append(grad_info_norm_outer.item())
+                    metrics.setdefault('grad_kld_norm_outer', []).append(grad_kld_norm_outer.item())
+
+                if args.lambda_type == 'annealing':
+                    # current_lambda_val = args.lambda_val * (step_total / args.steps) if args.steps > 0 else args.lambda_val
+                    # 코사인 어닐링을 사용한 완만한 증가:
+                    min_lambda_ratio = 0.1 # 최소 람다 비율 (args.lambda_val의 10%)
+                    max_lambda = args.lambda_val
+                    min_lambda = args.lambda_val * min_lambda_ratio
+
+                    if args.steps > 0 and step_total <= args.steps:
+                        # 코사인 곡선은 일반적으로 감소하는 형태이므로, 증가하도록 변형
+                        # 0에서 pi까지 코사인 값은 1에서 -1로 변함.
+                        # (1 - cos(pi * progress)) / 2  는 0에서 1로 증가하는 곡선
+                        progress = step_total / args.steps
+                        cosine_progress = (1 - math.cos(math.pi * progress)) / 2
+                        current_lambda_val = min_lambda + (max_lambda - min_lambda) * cosine_progress
+                    else:
+                        current_lambda_val = args.lambda_val
+                elif args.lambda_type == 'grad_aware':
+                    current_lambda_val = grad_info_norm_outer / (grad_kld_norm_outer + EPS) # Use global EPS
+                    # Clamp lambda to avoid extreme values, e.g., within [0.1 * args.lambda_val, 10 * args.lambda_val]
+                    # current_lambda_val = torch.clamp(current_lambda_val, 0.1 * args.lambda_val, 10 * args.lambda_val)
+
+
         if not args.loss_phi_abs:
-            loss_phi_infogap = weighted_mi - standard_mi + args.lambda_val * Div_as_regul
+            loss_phi_infogap = loss_info_term_outer + current_lambda_val * loss_kld_term_outer
         else:
-            loss_phi_infogap = (weighted_mi - standard_mi + args.lambda_val * Div_as_regul)**2
+            loss_phi_infogap = (loss_info_term_outer + current_lambda_val * loss_kld_term_outer)**2
         
         # L2 regularization term 추가
         l2_reg_loss = 0.0
@@ -1551,9 +1655,9 @@ def main():
         # the current implementation of CrossAttnDiscriminator assumes y will be projected to x_dim,
         # or that x_dim is used as the main dimension.
         # The MHA expects Q, K, V to have the same dimension unless kdim/vdim are specified.
-        # The CrossAttnDiscriminator uses args for num_heads, mlp_dim, dropout, spectral_norm.
-        # The `dim` argument to CrossAttnDiscriminator should be the primary embedding dimension (e.g., x_dim).
-        # The `y_dim` argument is also passed for clarity or future use if y needs projection.
+        # For simplicity, this implementation assumes Q, K, V will all be of dimension `dim`.
+        # If y_dim is different, it should be projected to `dim` before being passed to this discriminator,
+        # or this discriminator's design needs to handle differing Q and K/V dimensions.
         discriminator = CrossAttnDiscriminator(dim=x_dim, y_dim=y_dim).to(device)
         # CrossAttnDiscriminator does not have a specific weights_init applied in the CA script.
         # Consider if weights_init should be applied:
